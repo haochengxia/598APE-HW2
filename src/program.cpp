@@ -11,9 +11,424 @@
 #include <program.h>
 #include <random>
 #include <stack>
+#include <immintrin.h>
 
 namespace genetic {
 
+#ifdef USE_ICPX
+struct Instruction {
+    enum class Op {
+        LOAD_CONST, 
+        LOAD_VAR, 
+        BINARY_OP, 
+        UNARY_OP 
+    };
+    
+    Op op;
+    union {
+        float const_val; 
+        int var_idx; 
+        node::type op_type; 
+    };
+    int arity; 
+};
+
+std::vector<Instruction> compile_program(const program_t prog) {
+    std::vector<Instruction> instructions;
+    const node* const nodes = prog->nodes;
+    const int prog_len = prog->len;
+    
+    for (int i = prog_len - 1; i >= 0; --i) {
+        const node& curr = nodes[i];
+        
+        if (curr.t == node::type::constant) {
+            instructions.push_back({
+                Instruction::Op::LOAD_CONST,
+                {.const_val = curr.u.val},
+                0
+            });
+        }
+        else if (curr.t == node::type::variable) {
+            instructions.push_back({
+                Instruction::Op::LOAD_VAR,
+                {.var_idx = curr.u.fid},
+                0
+            });
+        }
+        else {
+            int ar = detail::arity(curr.t);
+            instructions.push_back({
+                ar > 1 ? Instruction::Op::BINARY_OP : Instruction::Op::UNARY_OP,
+                {.op_type = curr.t},
+                ar
+            });
+        }
+    }
+    return instructions;
+}
+
+template <int MaxSize = MAX_STACK_SIZE>
+void execute_kernel(const program_t d_progs, const float *data, float *y_pred,
+                    const uint64_t n_rows, const uint64_t n_progs) {
+    
+    for (uint64_t pid = 0; pid < n_progs; ++pid) {
+        const auto instructions = compile_program(d_progs + pid);
+        const uint64_t output_offset = pid * n_rows;
+        
+        #pragma omp parallel for if(n_rows > 100)
+        for (uint64_t row_id = 0; row_id < n_rows; row_id += 8) {
+            alignas(32) float stack_data[MaxSize][8];
+            int stack_top = 0;
+            
+            for (const auto& inst : instructions) {
+                switch (inst.op) {
+                    case Instruction::Op::LOAD_CONST: {
+                        __m256 const_val = _mm256_set1_ps(inst.const_val);
+                        _mm256_store_ps(&stack_data[stack_top][0], const_val);
+                        stack_top++;
+                        break;
+                    }
+                    
+                    case Instruction::Op::LOAD_VAR: {
+                        const float* src = data + inst.var_idx * n_rows + row_id;
+                        __m256 var_val = _mm256_loadu_ps(src);
+                        _mm256_store_ps(&stack_data[stack_top][0], var_val);
+                        stack_top++;
+                        break;
+                    }
+                    
+                    case Instruction::Op::BINARY_OP: {
+                        stack_top--;
+                        __m256 op2 = _mm256_load_ps(&stack_data[stack_top][0]);
+                        __m256 op1 = _mm256_load_ps(&stack_data[stack_top-1][0]);
+                        
+                        __m256 result;
+                        result = detail::evaluate_node_simd(
+                            {.t = inst.op_type}, 
+                            data, n_rows, row_id, 
+                            (__m256[]){op1, op2}
+                        );
+                        
+                        _mm256_store_ps(&stack_data[stack_top-1][0], result);
+                        break;
+                    }
+                    
+                    case Instruction::Op::UNARY_OP: {
+                        stack_top--;
+                        __m256 op = _mm256_load_ps(&stack_data[stack_top][0]);
+                        
+                        __m256 result = detail::evaluate_node_simd(
+                            {.t = inst.op_type}, 
+                            data, n_rows, row_id, 
+                            (__m256[]){op, _mm256_setzero_ps()}
+                        );
+                        
+                        _mm256_store_ps(&stack_data[stack_top][0], result);
+                        stack_top++;
+                        break;
+                    }
+                }
+            }
+            
+            __m256 final_result = _mm256_load_ps(&stack_data[stack_top-1][0]);
+            if (row_id + 8 <= n_rows) {
+                _mm256_storeu_ps(y_pred + output_offset + row_id, final_result);
+            } else {
+                alignas(32) float final_vals[8];
+                _mm256_store_ps(final_vals, final_result);
+                for (int i = 0; i < n_rows - row_id; ++i) {
+                    y_pred[output_offset + row_id + i] = final_vals[i];
+                }
+            }
+        }
+    }
+}
+#else
+#ifdef ENABLE_OMP
+template <int MaxSize = MAX_STACK_SIZE>
+void execute_kernel(const program_t d_progs, const float *data, float *y_pred,
+                    const uint64_t n_rows, const uint64_t n_progs) {
+  for (uint64_t pid = 0; pid < n_progs; ++pid) {
+    const program_t curr_p = d_progs + pid;
+    const node* const nodes = curr_p->nodes;
+    const int prog_len = curr_p->len;
+    const uint64_t output_offset = pid * n_rows;
+
+    #pragma omp parallel for if(n_rows > 100)
+    for (uint64_t row_id = 0; row_id < n_rows; ++row_id) {
+      alignas(64) float stack_data[MaxSize];
+      int stack_top = 0;
+
+      float res = 0.0f;
+      float in[2] = {0.0f, 0.0f};
+
+      const node* curr_node = nodes + prog_len - 1;
+      for (int end = prog_len - 1; end >= 0; --end, --curr_node) {
+        if (detail::is_nonterminal(curr_node->t)) {
+          const int ar = detail::arity(curr_node->t);
+          in[0] = stack_data[--stack_top];
+          if (ar > 1) {
+            in[1] = stack_data[--stack_top];
+          }
+        }
+        res = detail::evaluate_node(*curr_node, data, n_rows, row_id, in);
+        stack_data[stack_top++] = res;
+      }
+
+      y_pred[output_offset + row_id] = stack_data[--stack_top];
+    }
+  }
+}
+#else
+#ifdef ENABLE_OMP_BATCHED
+template <int MaxSize = MAX_STACK_SIZE, int BatchSize = 32>
+void execute_kernel(const program_t d_progs, const float *data, float *y_pred,
+                    const uint64_t n_rows, const uint64_t n_progs) {
+    for (uint64_t pid = 0; pid < n_progs; ++pid) {
+        const program_t curr_p = d_progs + pid;
+        const node* const nodes = curr_p->nodes;
+        const int prog_len = curr_p->len;
+        const uint64_t output_offset = pid * n_rows;
+
+        #pragma omp parallel for if(n_rows > 100)
+        for (uint64_t row_id = 0; row_id < n_rows; row_id += BatchSize) {
+            const int actual_batch = std::min(BatchSize, static_cast<int>(n_rows - row_id));
+            
+            alignas(64) float stack_data[MaxSize][BatchSize];
+            alignas(64) float batch_in[2][BatchSize];
+            alignas(64) float eval_inputs[2];
+            int stack_top = 0;
+            
+            const node* curr_node = nodes + prog_len - 1;
+            for (int end = prog_len - 1; end >= 0; --end, --curr_node) {
+                if (detail::is_nonterminal(curr_node->t)) {
+                    const int ar = detail::arity(curr_node->t);
+                    
+                    #pragma omp simd
+                    for (int b = 0; b < actual_batch; ++b) {
+                        batch_in[0][b] = stack_data[stack_top-1][b];
+                    }
+                    
+                    if (ar > 1) {
+                        #pragma omp simd
+                        for (int b = 0; b < actual_batch; ++b) {
+                            batch_in[1][b] = stack_data[stack_top-2][b];
+                        }
+                        stack_top -= 2;
+                    } else {
+                        stack_top -= 1;
+                    }
+                }
+
+                #pragma omp simd
+                for (int b = 0; b < actual_batch; ++b) {
+                    eval_inputs[0] = batch_in[0][b];
+                    eval_inputs[1] = curr_node->arity() > 1 ? batch_in[1][b] : 0.0f;
+                    
+                    stack_data[stack_top][b] = detail::evaluate_node(
+                        *curr_node, 
+                        data, 
+                        n_rows, 
+                        row_id + b, 
+                        eval_inputs
+                    );
+                }
+                stack_top++;
+            }
+
+            #pragma omp simd
+            for (int b = 0; b < actual_batch; ++b) {
+                y_pred[output_offset + row_id + b] = stack_data[stack_top-1][b];
+            }
+        }
+    }
+}
+#else
+#ifdef ENABLE_OMP_PRECOMPILE_BATCHED
+struct Instruction {
+    enum class Op {
+        LOAD_CONST,
+        LOAD_VAR,
+        COMPUTE
+    };
+    
+    Op op;
+    union {
+        float const_val;
+        int var_idx;
+        node::type op_type;
+    };
+    int arity;
+};
+
+std::vector<Instruction> compile_program(const program_t prog) {
+    std::vector<Instruction> instructions;
+    const node* const nodes = prog->nodes;
+    const int prog_len = prog->len;
+    
+    for (int i = prog_len - 1; i >= 0; --i) {
+        const node& curr = nodes[i];
+        
+        if (curr.t == node::type::constant) {
+            instructions.push_back({
+                .op = Instruction::Op::LOAD_CONST,
+                .const_val = curr.u.val,
+                .arity = 0
+            });
+        }
+        else if (curr.t == node::type::variable) {
+            instructions.push_back({
+                .op = Instruction::Op::LOAD_VAR,
+                .var_idx = curr.u.fid,
+                .arity = 0
+            });
+        }
+        else {
+            instructions.push_back({
+                .op = Instruction::Op::COMPUTE,
+                .op_type = curr.t,
+                .arity = detail::arity(curr.t)
+            });
+        }
+    }
+    return instructions;
+}
+
+template <int MaxSize = MAX_STACK_SIZE, int BatchSize = 32>
+void execute_kernel(const program_t d_progs, const float *data, float *y_pred,
+                    const uint64_t n_rows, const uint64_t n_progs) {
+    
+    if (n_progs > 1) {
+        #pragma omp parallel for schedule(dynamic)
+        for (uint64_t pid = 0; pid < n_progs; ++pid) {
+            const auto instructions = compile_program(d_progs + pid);
+            const uint64_t output_offset = pid * n_rows;
+            
+            alignas(64) float stack_data[MaxSize][BatchSize];
+            alignas(64) float inputs[2][BatchSize];
+            node temp_node;
+            
+            for (uint64_t row_id = 0; row_id < n_rows; row_id += BatchSize) {
+                const int actual_batch = std::min(BatchSize, static_cast<int>(n_rows - row_id));
+                int stack_top = 0;
+                
+                for (const auto& inst : instructions) {
+                    switch (inst.op) {
+                        case Instruction::Op::LOAD_CONST: {
+                            #pragma omp simd
+                            for (int b = 0; b < actual_batch; ++b) {
+                                stack_data[stack_top][b] = inst.const_val;
+                            }
+                            stack_top++;
+                            break;
+                        }
+                        
+                        case Instruction::Op::LOAD_VAR: {
+                            const float* src = data + inst.var_idx * n_rows + row_id;
+                            #pragma omp simd
+                            for (int b = 0; b < actual_batch; ++b) {
+                                stack_data[stack_top][b] = src[b];
+                            }
+                            stack_top++;
+                            break;
+                        }
+                        
+                        case Instruction::Op::COMPUTE: {
+                            temp_node.t = inst.op_type;
+                            
+                            #pragma omp simd
+                            for (int b = 0; b < actual_batch; ++b) {
+                                inputs[0][b] = stack_data[stack_top-1][b];
+                                if (inst.arity > 1) {
+                                    inputs[1][b] = stack_data[stack_top-2][b];
+                                }
+                            }
+                            
+                            #pragma omp simd
+                            for (int b = 0; b < actual_batch; ++b) {
+                                const float curr_inputs[2] = {
+                                    inputs[0][b],
+                                    inst.arity > 1 ? inputs[1][b] : 0.0f
+                                };
+                                
+                                stack_data[stack_top - inst.arity][b] = detail::evaluate_node(
+                                    temp_node,
+                                    data,
+                                    n_rows,
+                                    row_id + b,
+                                    curr_inputs
+                                );
+                            }
+                            stack_top = stack_top - inst.arity + 1;
+                            break;
+                        }
+                    }
+                }
+                
+                #pragma omp simd
+                for (int b = 0; b < actual_batch; ++b) {
+                    y_pred[output_offset + row_id + b] = stack_data[stack_top-1][b];
+                }
+            }
+        }
+    } else {
+        const auto instructions = compile_program(d_progs);
+        
+        #pragma omp parallel for schedule(dynamic) if(n_rows > 10000)
+        for (uint64_t row_id = 0; row_id < n_rows; row_id += BatchSize) {
+            const int actual_batch = std::min(BatchSize, static_cast<int>(n_rows - row_id));
+            
+            float stack_data[MaxSize][BatchSize];
+            int stack_top = 0;
+            
+            node temp_node;
+            float inputs[2];
+            
+            for (const auto& inst : instructions) {
+                switch (inst.op) {
+                    case Instruction::Op::LOAD_CONST:
+                        for (int b = 0; b < actual_batch; ++b) {
+                            stack_data[stack_top][b] = inst.const_val;
+                        }
+                        stack_top++;
+                        break;
+                        
+                    case Instruction::Op::LOAD_VAR:
+                        for (int b = 0; b < actual_batch; ++b) {
+                            stack_data[stack_top][b] = data[inst.var_idx * n_rows + row_id + b];
+                        }
+                        stack_top++;
+                        break;
+                        
+                    case Instruction::Op::COMPUTE:
+                        temp_node.t = inst.op_type;
+                        
+                        for (int b = 0; b < actual_batch; ++b) {
+                            inputs[0] = stack_data[stack_top-1][b];
+                            if (inst.arity > 1) {
+                                inputs[1] = stack_data[stack_top-2][b];
+                            }
+                            
+                            stack_data[stack_top - inst.arity][b] = detail::evaluate_node(
+                                temp_node,
+                                data,
+                                n_rows,
+                                row_id + b,
+                                inputs
+                            );
+                        }
+                        stack_top = stack_top - inst.arity + 1;
+                        break;
+                }
+            }
+            
+            for (int b = 0; b < actual_batch; ++b) {
+                y_pred[row_id + b] = stack_data[stack_top-1][b];
+            }
+        }
+    }
+}
+#else
 /**
  * Execution kernel for a single program. We assume that the input data
  * is stored in column major format.
@@ -51,7 +466,10 @@ void execute_kernel(const program_t d_progs, const float *data, float *y_pred,
     }
   }
 }
-
+#endif
+#endif
+#endif
+#endif
 program::program()
     : len(0), depth(0), raw_fitness_(0.0f), metric(metric_t::mse),
       mut_type(mutation_t::none), nodes(nullptr) {}
@@ -123,43 +541,115 @@ void find_batched_fitness(int n_progs, program_t d_progs, float *score,
                           const param &params, const int n_rows,
                           const float *data, const float *y,
                           const float *sample_weights) {
+#ifdef ENABLE_COMMON
+  static thread_local struct BufferPool {
+    float* buffer = nullptr;
+    size_t capacity = 0;
+    
+    ~BufferPool() {
+      if (buffer) {
+        free(buffer);
+      }
+    }
+    
+    float* get_buffer(size_t required_size) {
+      if (capacity < required_size) {
+        if (buffer) {
+          free(buffer);
+        }
+        buffer = (float*)aligned_alloc(64, required_size * sizeof(float));
+        capacity = required_size;
+      }
+      return buffer;
+    }
+  } buffer_pool;
 
+  const size_t required_size = (uint64_t)n_rows * (uint64_t)n_progs;
+  float* y_pred = buffer_pool.get_buffer(required_size);
+
+  execute(d_progs, n_rows, n_progs, data, y_pred);
+
+  compute_metric(n_rows, n_progs, y, y_pred, sample_weights, score, params);
+#else
   std::vector<float> y_pred((uint64_t)n_rows * (uint64_t)n_progs);
   execute(d_progs, n_rows, n_progs, data, y_pred.data());
 
   // Compute error
   compute_metric(n_rows, n_progs, y, y_pred.data(), sample_weights, score,
                  params);
+#endif
+}
+
+#ifdef ENABLE_COMMON
+void set_batched_fitness(int n_progs, std::vector<program> &h_progs,
+                         const param &params, const int n_rows,
+                         const float *data, const float *y,
+                         const float *sample_weights) {
+    static thread_local struct ScorePool {
+        float* buffer = nullptr;
+        size_t capacity = 0;
+        
+        ~ScorePool() {
+            if (buffer) {
+                free(buffer);
+            }
+        }
+        
+        float* get_buffer(size_t required_size) {
+            if (capacity < required_size) {
+                if (buffer) {
+                    free(buffer);
+                }
+                buffer = (float*)aligned_alloc(64, required_size * sizeof(float));
+                capacity = required_size;
+            }
+            return buffer;
+        }
+    } score_pool;
+
+    float* score = score_pool.get_buffer(n_progs);
+
+    find_batched_fitness(n_progs, h_progs.data(), score, params, n_rows,
+                         data, y, sample_weights);
+
+    #pragma omp simd
+    for (int i = 0; i < n_progs; ++i) {
+        h_progs[i].raw_fitness_ = score[i];
+    }
 }
 
 void set_fitness(program &h_prog, const param &params, const int n_rows,
                  const float *data, const float *y,
                  const float *sample_weights) {
+    static thread_local struct SingleScorePool {
+        float buffer[1];
+    } score_pool;
 
-  std::vector<float> score(1);
+    find_fitness(&h_prog, score_pool.buffer, params, n_rows, data, y, sample_weights);
 
-  find_fitness(&h_prog, score.data(), params, n_rows, data, y, sample_weights);
-
-  // Update host and device score for program
-  h_prog.raw_fitness_ = score[0];
+    h_prog.raw_fitness_ = score_pool.buffer[0];
 }
-
+#else
 void set_batched_fitness(int n_progs, std::vector<program> &h_progs,
                          const param &params, const int n_rows,
                          const float *data, const float *y,
                          const float *sample_weights) {
-
-  std::vector<float> score(n_progs);
-
-  find_batched_fitness(n_progs, h_progs.data(), score.data(), params, n_rows,
-                       data, y, sample_weights);
-
-  // Update scores on host and device
-  // TODO: Find a way to reduce the number of implicit memory transfers
-  for (auto i = 0; i < n_progs; ++i) {
-    h_progs[i].raw_fitness_ = score[i];
-  }
+    std::vector<float> score(n_progs);
+    find_batched_fitness(n_progs, h_progs.data(), score.data(), params, n_rows,
+                         data, y, sample_weights);
+    for (int i = 0; i < n_progs; ++i) {
+        h_progs[i].raw_fitness_ = score[i];
+    }
 }
+
+void set_fitness(program &h_prog, const param &params, const int n_rows,
+                 const float *data, const float *y,
+                 const float *sample_weights) {
+    std::vector<float> score(1);
+    find_fitness(&h_prog, score.data(), params, n_rows, data, y, sample_weights);
+    h_prog.raw_fitness_ = score[0];
+}
+#endif
 
 float get_fitness(const program &prog, const param &params) {
   int crit = params.criterion();
@@ -219,6 +709,33 @@ std::pair<int, int> get_subtree(node *pnodes, int len, PhiloxEngine &rng) {
   return std::make_pair(start, end);
 }
 
+#ifdef ENABLE_COMMON
+int get_depth(const program &p_out) {
+  static constexpr int MAX_DEPTH = 64;
+  int arity_array[MAX_DEPTH];
+  int stack_size = 0;
+  int depth = 0;
+
+  const node* const nodes = p_out.nodes;
+  const int len = p_out.len;
+
+  for (int i = 0; i < len; ++i) {
+    depth = std::max(depth, stack_size);
+
+    if (detail::is_nonterminal(nodes[i].t)) {
+      arity_array[stack_size++] = detail::arity(nodes[i].t);
+    } else {
+      if (stack_size == 0) break;
+      
+      do {
+        if (--arity_array[stack_size - 1] > 0) break;
+        --stack_size;
+      } while (stack_size > 0);
+    }
+  }
+  return depth;
+}
+#else
 int get_depth(const program &p_out) {
   int depth = 0;
   std::stack<int> arity_stack;
@@ -255,6 +772,7 @@ int get_depth(const program &p_out) {
 
   return depth;
 }
+#endif
 
 void build_program(program &p_out, const param &params, PhiloxEngine &rng) {
   // Define data structures needed for tree

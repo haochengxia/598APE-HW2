@@ -10,7 +10,11 @@ namespace genetic {
  * @brief The main data structure to store the AST that represents a program
  *        in the current generation
  */
+#ifdef ENABLE_COMMON
+struct alignas(16) program {
+#else
 struct program {
+#endif
   /**
    * the AST. It is stored in the reverse of DFS-right-child-first order. In
    * other words, construct a regular AST in the form of depth-first, but

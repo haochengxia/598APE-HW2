@@ -119,6 +119,27 @@ float mean_squared_error(const std::vector<float> &y_true,
   return sum / y_true.size();
 }
 
+#ifdef ENABLE_COMMON
+float accuracy(const std::vector<float> &y_true,
+               const std::vector<float> &y_pred) {
+    if (y_true.size() != y_pred.size()) {
+        throw std::runtime_error("Arrays must have the same length");
+    }
+
+    const size_t n = y_true.size();
+    const float threshold = 0.5f;
+    size_t correct = 0;
+
+    #pragma omp simd reduction(+:correct)
+    for (size_t i = 0; i < n; ++i) {
+        const bool pred_class = y_pred[i] >= threshold;
+        const bool true_class = y_true[i] >= threshold;
+        correct += (pred_class == true_class);
+    }
+
+    return static_cast<float>(correct) / n;
+}
+#else
 // Calculate accuracy for classification
 float accuracy(const std::vector<float> &y_true,
                const std::vector<float> &y_pred) {
@@ -136,7 +157,7 @@ float accuracy(const std::vector<float> &y_true,
 
   return static_cast<float>(correct) / y_true.size();
 }
-
+#endif
 } // namespace utils
 
 using namespace genetic;
@@ -160,6 +181,39 @@ void insertionSortPrograms(genetic::program *programs, int size) {
     }
     programs[j + 1] = key;
   }
+}
+
+void find_top_2_programs(program* programs, int size, program*& best1, program*& best2) {
+    // deal with nan values
+    best1 = nullptr;
+    best2 = nullptr;
+    float min1 = std::numeric_limits<float>::max();
+    float min2 = std::numeric_limits<float>::max();
+
+    // first scan to find min1
+    for (int i = 0; i < size; ++i) {
+        float fitness = programs[i].raw_fitness_;
+        if (std::isnan(fitness)) continue;
+        
+        if (fitness < min1) {
+            min1 = fitness;
+            best1 = &programs[i];
+        }
+    }
+
+    // if no valid min1 found, return
+    if (!best1) return;
+
+    // second scan to find min2
+    for (int i = 0; i < size; ++i) {
+        float fitness = programs[i].raw_fitness_;
+        if (std::isnan(fitness)) continue;
+        
+        if (&programs[i] != best1 && fitness < min2) {
+            min2 = fitness;
+            best2 = &programs[i];
+        }
+    }
 }
 
 void run_symbolic_regression(const std::string &dataset_file) {
@@ -252,8 +306,16 @@ void run_symbolic_regression(const std::string &dataset_file) {
   // }
 
   // Predict on top 2 candidates
-  insertionSortPrograms(final_programs, params.population_size);
+#ifdef ENABLE_REMOVE_INSERTION_SORT
+  program *best1, *best2;
+  find_top_2_programs(final_programs, params.population_size, best1, best2);
+  std::vector<float> y_pred1(X_test.size());
+  genetic::symRegPredict(X_test_flat.data(), X_test.size(), best1, y_pred1.data());
 
+  std::vector<float> y_pred2(X_test.size());
+  genetic::symRegPredict(X_test_flat.data(), X_test.size(), best2, y_pred2.data());
+#else
+  insertionSortPrograms(final_programs, params.population_size);
   std::vector<float> y_pred1(X_test.size());
   genetic::symRegPredict(X_test_flat.data(), X_test.size(), &final_programs[0],
                          y_pred1.data());
@@ -261,6 +323,7 @@ void run_symbolic_regression(const std::string &dataset_file) {
   std::vector<float> y_pred2(X_test.size());
   genetic::symRegPredict(X_test_flat.data(), X_test.size(), &final_programs[1],
                          y_pred2.data());
+#endif
 
   // Calculate MSE on test set
   float mse = utils::mean_squared_error(y_test, y_pred1);
@@ -268,7 +331,13 @@ void run_symbolic_regression(const std::string &dataset_file) {
 
   // Extract the best programs and print some stats
   if (history.back().size() > 0) {
+#ifdef ENABLE_REMOVE_INSERTION_SORT
+    genetic::program_t best_program1 = best1;
+    genetic::program_t best_program2 = best2;
+#else
     genetic::program_t best_program1 = &final_programs[0];
+    genetic::program_t best_program2 = &final_programs[1];
+#endif
     std::cout << "Best program 1 details:" << std::endl;
     std::cout << "- Length: " << best_program1->len << " nodes" << std::endl;
     std::cout << "- Depth: " << best_program1->depth << std::endl;
@@ -279,7 +348,6 @@ void run_symbolic_regression(const std::string &dataset_file) {
     std::string program_str = genetic::stringify(*best_program1);
     std::cout << "- Program: " << program_str << std::endl;
 
-    genetic::program_t best_program2 = &final_programs[1];
     std::cout << "Best program 2 details:" << std::endl;
     std::cout << "- Length: " << best_program2->len << " nodes" << std::endl;
     std::cout << "- Depth: " << best_program2->depth << std::endl;
@@ -393,6 +461,16 @@ void run_symbolic_classification(const std::string &dataset_file) {
   // }
 
   // Predict classes for best 2 programs acc to training
+  // 
+#ifdef ENABLE_REMOVE_INSERTION_SORT
+  program *best1, *best2;
+  find_top_2_programs(final_programs, params.population_size, best1, best2);
+  std::vector<float> y_pred1(X_test.size());
+  genetic::symClfPredict(X_test_flat.data(), X_test.size(), params, best1, y_pred1.data());
+
+  std::vector<float> y_pred2(X_test.size());
+  genetic::symClfPredict(X_test_flat.data(), X_test.size(), params, best2, y_pred2.data());
+#else
   insertionSortPrograms(final_programs, params.population_size);
   std::vector<float> y_pred1(X_test.size());
   genetic::symClfPredict(X_test_flat.data(), X_test.size(), params,
@@ -401,13 +479,19 @@ void run_symbolic_classification(const std::string &dataset_file) {
   std::vector<float> y_pred2(X_test.size());
   genetic::symClfPredict(X_test_flat.data(), X_test.size(), params,
                          &final_programs[1], y_pred2.data());
-
+#endif
   float acc = utils::accuracy(y_test, y_pred1);
   float acc2 = utils::accuracy(y_test, y_pred2);
 
   // Extract the best programs and print some stats
+#ifdef ENABLE_REMOVE_INSERTION_SORT
+  genetic::program_t best_program1 = best1;
+  genetic::program_t best_program2 = best2;
+#else
+  genetic::program_t best_program1 = &final_programs[0];
+  genetic::program_t best_program2 = &final_programs[1];
+#endif
   if (history.back().size() > 0) {
-    genetic::program_t best_program1 = &final_programs[0];
     std::cout << "Best program 1 details:" << std::endl;
     std::cout << "- Length: " << best_program1->len << " nodes" << std::endl;
     std::cout << "- Depth: " << best_program1->depth << std::endl;
@@ -452,7 +536,9 @@ int main(int argc, char *argv[]) {
     } else if (arg_dset == "cancer") {
       run_symbolic_classification(classification_dataset);
     } else if (arg_dset == "housing") {
-      run_symbolic_regression(housing_dataset);
+      for (int i = 0; i < 1; ++i) {
+        run_symbolic_regression(housing_dataset);
+      }
     }
 
     return 0;

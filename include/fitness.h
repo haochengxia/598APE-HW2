@@ -229,6 +229,36 @@ void meanAbsoluteError(const uint64_t n_samples, const uint64_t n_progs,
   }
 }
 
+#ifdef ENABLE_COMMON
+template <typename math_t = float>
+void meanSquareError(const uint64_t n_samples, const uint64_t n_progs,
+                     const math_t *Y, const math_t *Y_pred, const math_t *W,
+                     math_t *out) {
+    const math_t N = static_cast<math_t>(n_samples);
+    
+    math_t WS = static_cast<math_t>(0);
+    #pragma omp simd reduction(+:WS)
+    for (uint64_t i = 0; i < n_samples; ++i) {
+        WS += W[i];
+    }
+    
+    const math_t scale = N / WS;
+    
+    #pragma omp parallel for if(n_progs > 1)
+    for (uint64_t pid = 0; pid < n_progs; ++pid) {
+        math_t sum = 0;
+        const math_t* Y_pred_prog = Y_pred + pid * n_samples;
+        
+        #pragma omp simd reduction(+:sum)
+        for (uint64_t i = 0; i < n_samples; ++i) {
+            const math_t diff = Y_pred_prog[i] - Y[i];
+            sum += W[i] * diff * diff;
+        }
+        
+        out[pid] = sum * scale / N;
+    }
+}
+#else
 template <typename math_t = float>
 void meanSquareError(const uint64_t n_samples, const uint64_t n_progs,
                      const math_t *Y, const math_t *Y_pred, const math_t *W,
@@ -260,7 +290,7 @@ void meanSquareError(const uint64_t n_samples, const uint64_t n_progs,
     }
   }
 }
-
+#endif
 template <typename math_t = float>
 void rootMeanSquareError(const uint64_t n_samples, const uint64_t n_progs,
                          const math_t *Y, const math_t *Y_pred, const math_t *W,

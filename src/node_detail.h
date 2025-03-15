@@ -1,5 +1,6 @@
 #pragma once
 
+#include <immintrin.h>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -26,7 +27,109 @@ inline int arity(node::type t) {
   return 0;
 }
 
-// `data` assumed to be stored in col-major format
+#ifdef ENABLE_SIMD
+inline __m256 evaluate_node_simd(const node &n, const float *data, 
+                                const uint64_t stride, const uint64_t idx, 
+                                const __m256 *in) {
+    if (n.t == node::type::constant) {
+        return _mm256_set1_ps(n.u.val);
+    } else if (n.t == node::type::variable) {
+        return _mm256_loadu_ps(data + (stride * n.u.fid) + idx);
+    } else {
+        __m256 abs_inval = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), in[0]);
+        __m256 abs_inval1 = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), in[1]);
+        
+        switch (n.t) {
+        // binary operators
+        case node::type::add:
+            return _mm256_add_ps(in[0], in[1]);
+        case node::type::mul:
+            return _mm256_mul_ps(in[0], in[1]);
+        case node::type::sub:
+            return _mm256_sub_ps(in[0], in[1]);
+        case node::type::div: {
+            __m256 min_mask = _mm256_cmp_ps(abs_inval1, _mm256_set1_ps(MIN_VAL), _CMP_LT_OQ);
+            __m256 div_result = _mm256_div_ps(in[0], in[1]);
+            return _mm256_blendv_ps(div_result, _mm256_set1_ps(1.0f), min_mask);
+        }
+        case node::type::max:
+            return _mm256_max_ps(in[0], in[1]);
+        case node::type::min:
+            return _mm256_min_ps(in[0], in[1]);
+        case node::type::pow:
+            return _mm256_pow_ps(in[0], in[1]);
+        case node::type::atan2:
+            return _mm256_atan2_ps(in[0], in[1]);
+        case node::type::fdim: {
+            __m256 diff = _mm256_sub_ps(in[0], in[1]);
+            return _mm256_max_ps(diff, _mm256_setzero_ps());
+        }
+            
+        // unary operators
+        case node::type::abs:
+            return abs_inval;
+        case node::type::neg:
+            return _mm256_xor_ps(in[0], _mm256_set1_ps(-0.0f));
+        case node::type::sq:
+            return _mm256_mul_ps(in[0], in[0]);
+        case node::type::cube:
+            return _mm256_mul_ps(_mm256_mul_ps(in[0], in[0]), in[0]);
+        case node::type::sqrt:
+            return _mm256_sqrt_ps(abs_inval);
+        case node::type::cbrt:
+            return _mm256_cbrt_ps(in[0]);
+        case node::type::inv: {
+            __m256 min_mask = _mm256_cmp_ps(abs_inval, _mm256_set1_ps(MIN_VAL), _CMP_LT_OQ);
+            __m256 inv_result = _mm256_div_ps(_mm256_set1_ps(1.0f), in[0]);
+            return _mm256_blendv_ps(inv_result, _mm256_set1_ps(0.0f), min_mask);
+        }
+        case node::type::rcbrt:
+            return _mm256_div_ps(_mm256_set1_ps(1.0f), _mm256_cbrt_ps(in[0]));
+        case node::type::rsqrt:
+            return _mm256_div_ps(_mm256_set1_ps(1.0f), _mm256_sqrt_ps(abs_inval));
+            
+        // trigonometric functions
+        case node::type::sin:
+            return _mm256_sin_ps(in[0]);
+        case node::type::cos:
+            return _mm256_cos_ps(in[0]);
+        case node::type::tan:
+            return _mm256_tan_ps(in[0]);
+        case node::type::asin:
+            return _mm256_asin_ps(in[0]);
+        case node::type::acos:
+            return _mm256_acos_ps(in[0]);
+        case node::type::atan:
+            return _mm256_atan_ps(in[0]);
+            
+        // hyperbolic functions
+        case node::type::sinh:
+            return _mm256_sinh_ps(in[0]);
+        case node::type::cosh:
+            return _mm256_cosh_ps(in[0]);
+        case node::type::tanh:
+            return _mm256_tanh_ps(in[0]);
+        case node::type::asinh:
+            return _mm256_asinh_ps(in[0]);
+        case node::type::acosh:
+            return _mm256_acosh_ps(in[0]);
+        case node::type::atanh:
+            return _mm256_atanh_ps(in[0]);
+            
+        // exponential and logarithmic functions
+        case node::type::exp:
+            return _mm256_exp_ps(in[0]);
+        case node::type::log: {
+            __m256 safe_input = _mm256_max_ps(abs_inval, _mm256_set1_ps(MIN_VAL));
+            return _mm256_log_ps(safe_input);
+        }
+            
+        default:
+            return _mm256_setzero_ps();
+        }
+    }
+}
+#endif
 inline float evaluate_node(const node &n, const float *data, const uint64_t stride,
                     const uint64_t idx, const float *in) {
   if (n.t == node::type::constant) {

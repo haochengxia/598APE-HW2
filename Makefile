@@ -1,5 +1,79 @@
-CXX := g++
+#######################################
+# negative optimization
+#######################################
+USE_ICPX ?= 0
+#######################################
+
+ifeq ($(USE_ICPX), 1)
+    CXX := icpx
+else
+    CXX := g++
+endif
+
 CXXFLAGS := -std=c++17 -Wall -Wextra -I include -I. 
+#######################
+
+ENABLE_BETTER_OPT ?= 0
+
+# for common optimization, like allocation
+ENABLE_COMMON ?= 0
+
+# for stack operation, use array to simulate stack
+ENABLE_STACK ?= 0
+
+# for remove insertion sort
+ENABLE_REMOVE_INSERTION_SORT ?= 0
+
+# for kernel execution, enable one of them
+ENABLE_OMP ?= 0
+ENABLE_OMP_BATCHED ?= 0
+ENABLE_OMP_PRECOMPILE_BATCHED ?= 0
+
+ifeq ($(ENABLE_BETTER_OPT), 1)
+    EXTRA_FLAGS += -O3
+	ifeq ($(USE_ICPX), 1)
+		EXTRA_FLAGS += -xCORE-AVX2
+	else
+		EXTRA_FLAGS += -march=native
+	endif
+endif
+
+ifeq ($(ENABLE_COMMON), 1)
+    EXTRA_FLAGS += -DENABLE_COMMON -fopenmp
+endif
+
+ifeq ($(ENABLE_STACK), 1)
+    EXTRA_FLAGS += -DENABLE_STACK
+endif
+
+ifeq ($(ENABLE_KERNEL), 1)
+    EXTRA_FLAGS += -DENABLE_KERNEL -fopenmp -ffast-math
+endif
+
+ifeq ($(ENABLE_REMOVE_INSERTION_SORT), 1)
+    EXTRA_FLAGS += -DENABLE_REMOVE_INSERTION_SORT
+endif
+
+ifeq ($(ENABLE_OMP), 1)
+    EXTRA_FLAGS += -DENABLE_OMP -fopenmp
+endif
+
+ifeq ($(ENABLE_OMP_BATCHED), 1)
+    EXTRA_FLAGS += -DENABLE_OMP_BATCHED -fopenmp
+endif
+
+ifeq ($(ENABLE_OMP_PRECOMPILE_BATCHED), 1)
+    EXTRA_FLAGS += -DENABLE_OMP_PRECOMPILE_BATCHED -fopenmp
+endif
+
+#############################################
+# if use icpx, shut down the following flags: ENABLE_OMP, ENABLE_OMP_BATCHED, ENABLE_OMP_PRECOMPILE_BATCHED
+ifeq ($(USE_ICPX), 1)
+    EXTRA_FLAGS += -DENABLE_OMP=0 -DENABLE_OMP_BATCHED=0 -DENABLE_OMP_PRECOMPILE_BATCHED=0
+endif
+
+#############################################
+
 
 # Directories
 SRC_DIR := src
@@ -27,12 +101,12 @@ directories:
 # Compile source files to object files
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
 	@echo "Compiling $<..."
-	@$(CXX) $(CXXFLAGS) -c $< -o $@
+	@$(CXX) $(CXXFLAGS) $(EXTRA_FLAGS) -c $< -o $@
 
 # build benchmark lib 
 $(BENCH_BIN): $(BENCH_SRC) $(OBJS)
 	@echo "Building benchmark program..."
-	@$(CXX) $(CXXFLAGS) $< $(OBJS) -o $@ 
+	@$(CXX) $(CXXFLAGS) $(EXTRA_FLAGS) $< $(OBJS) -o $@ 
 
 # Clean build files
 clean:

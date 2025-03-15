@@ -2,6 +2,49 @@
 
 namespace genetic {
 
+#ifdef ENABLE_STACK
+template <typename DataT, int MaxSize> 
+struct stack {
+  explicit stack() : top_(0) {
+    #ifdef __GNUC__
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+    #endif
+    
+    // avoid initialization of array to improve performance
+    // regs_ array will be written to when actually used
+  }
+
+  // inline to reduce function call overhead
+  __attribute__((always_inline)) 
+  void push(DataT val) {
+    // directly write to the top
+    regs_[top_++] = val;
+  }
+
+  __attribute__((always_inline)) 
+  DataT pop() {
+    // directly return the top element
+    return regs_[--top_];
+  }
+
+  __attribute__((always_inline)) 
+  bool empty() const { 
+    return top_ == 0; 
+  }
+
+  __attribute__((always_inline)) 
+  int size() const { 
+    return top_; 
+  }
+
+  private:
+    // use a single pointer to track the top
+    int top_;
+    // align memory to optimize access
+    alignas(64) DataT regs_[MaxSize];
+};
+#else
 /**
  * @brief A fixed capacity stack on device currently used for AST evaluation
  *
@@ -72,5 +115,5 @@ private:
   int elements_;
   DataT regs_[MaxSize];
 }; // struct stack
-
+#endif
 } // namespace genetic
