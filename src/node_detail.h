@@ -27,7 +27,7 @@ inline int arity(node::type t) {
   return 0;
 }
 
-#ifdef ENABLE_SIMD
+#ifdef USE_ICPX
 inline __m256 evaluate_node_simd(const node &n, const float *data, 
                                 const uint64_t stride, const uint64_t idx, 
                                 const __m256 *in) {

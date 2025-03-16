@@ -67,78 +67,136 @@ std::vector<Instruction> compile_program(const program_t prog) {
     return instructions;
 }
 
-template <int MaxSize = MAX_STACK_SIZE>
+template <int MaxSize = MAX_STACK_SIZE, int BatchSize = 32>
 void execute_kernel(const program_t d_progs, const float *data, float *y_pred,
                     const uint64_t n_rows, const uint64_t n_progs) {
     
+    constexpr int SIMD_WIDTH = 8;  // AVX2 processes 8 floats at once
+    constexpr int BATCH_SIMD = BatchSize / SIMD_WIDTH;  // Number of SIMD operations per batch
+    
+    #pragma omp parallel for if(n_progs > 1)
     for (uint64_t pid = 0; pid < n_progs; ++pid) {
         const auto instructions = compile_program(d_progs + pid);
         const uint64_t output_offset = pid * n_rows;
         
-        #pragma omp parallel for if(n_rows > 100)
-        for (uint64_t row_id = 0; row_id < n_rows; row_id += 8) {
-            alignas(32) float stack_data[MaxSize][8];
+        #pragma omp parallel for if(n_rows > 1000)
+        for (uint64_t row_id = 0; row_id < n_rows; row_id += BatchSize) {
+            const int actual_batch = std::min(BatchSize, static_cast<int>(n_rows - row_id));
+            const int full_simd_iters = actual_batch / SIMD_WIDTH;
+            
+            // Aligned stack for both batch and SIMD processing
+            alignas(32) float stack_data[MaxSize][BatchSize];
             int stack_top = 0;
             
             for (const auto& inst : instructions) {
                 switch (inst.op) {
                     case Instruction::Op::LOAD_CONST: {
                         __m256 const_val = _mm256_set1_ps(inst.const_val);
-                        _mm256_store_ps(&stack_data[stack_top][0], const_val);
+                        // Process SIMD_WIDTH elements at a time
+                        for (int b = 0; b < full_simd_iters; ++b) {
+                            _mm256_store_ps(&stack_data[stack_top][b * SIMD_WIDTH], const_val);
+                        }
+                        // Handle remaining elements
+                        if (actual_batch % SIMD_WIDTH != 0) {
+                            alignas(32) float temp[SIMD_WIDTH];
+                            _mm256_store_ps(temp, const_val);
+                            for (int i = full_simd_iters * SIMD_WIDTH; i < actual_batch; ++i) {
+                                stack_data[stack_top][i] = temp[i % SIMD_WIDTH];
+                            }
+                        }
                         stack_top++;
                         break;
                     }
                     
                     case Instruction::Op::LOAD_VAR: {
                         const float* src = data + inst.var_idx * n_rows + row_id;
-                        __m256 var_val = _mm256_loadu_ps(src);
-                        _mm256_store_ps(&stack_data[stack_top][0], var_val);
+                        // Process SIMD_WIDTH elements at a time
+                        for (int b = 0; b < full_simd_iters; ++b) {
+                            __m256 var_val = _mm256_loadu_ps(src + b * SIMD_WIDTH);
+                            _mm256_store_ps(&stack_data[stack_top][b * SIMD_WIDTH], var_val);
+                        }
+                        // Handle remaining elements
+                        for (int i = full_simd_iters * SIMD_WIDTH; i < actual_batch; ++i) {
+                            stack_data[stack_top][i] = src[i];
+                        }
                         stack_top++;
                         break;
                     }
                     
                     case Instruction::Op::BINARY_OP: {
                         stack_top--;
-                        __m256 op2 = _mm256_load_ps(&stack_data[stack_top][0]);
-                        __m256 op1 = _mm256_load_ps(&stack_data[stack_top-1][0]);
-                        
-                        __m256 result;
-                        result = detail::evaluate_node_simd(
-                            {.t = inst.op_type}, 
-                            data, n_rows, row_id, 
-                            (__m256[]){op1, op2}
-                        );
-                        
-                        _mm256_store_ps(&stack_data[stack_top-1][0], result);
+                        // Process SIMD_WIDTH elements at a time
+                        for (int b = 0; b < full_simd_iters; ++b) {
+                            __m256 op2 = _mm256_load_ps(&stack_data[stack_top][b * SIMD_WIDTH]);
+                            __m256 op1 = _mm256_load_ps(&stack_data[stack_top-1][b * SIMD_WIDTH]);
+                            
+                            __m256 result = detail::evaluate_node_simd(
+                                {.t = inst.op_type},
+                                data, n_rows, row_id + b * SIMD_WIDTH,
+                                (__m256[]){op1, op2}
+                            );
+                            
+                            _mm256_store_ps(&stack_data[stack_top-1][b * SIMD_WIDTH], result);
+                        }
+                        // Handle remaining elements
+                        for (int i = full_simd_iters * SIMD_WIDTH; i < actual_batch; ++i) {
+                            const float inputs[2] = {
+                                stack_data[stack_top-1][i],
+                                stack_data[stack_top][i]
+                            };
+                            stack_data[stack_top-1][i] = detail::evaluate_node(
+                                {.t = inst.op_type},
+                                data,
+                                n_rows,
+                                row_id + i,
+                                inputs
+                            );
+                        }
                         break;
                     }
                     
                     case Instruction::Op::UNARY_OP: {
                         stack_top--;
-                        __m256 op = _mm256_load_ps(&stack_data[stack_top][0]);
-                        
-                        __m256 result = detail::evaluate_node_simd(
-                            {.t = inst.op_type}, 
-                            data, n_rows, row_id, 
-                            (__m256[]){op, _mm256_setzero_ps()}
-                        );
-                        
-                        _mm256_store_ps(&stack_data[stack_top][0], result);
+                        // Process SIMD_WIDTH elements at a time
+                        for (int b = 0; b < full_simd_iters; ++b) {
+                            __m256 op = _mm256_load_ps(&stack_data[stack_top][b * SIMD_WIDTH]);
+                            
+                            __m256 result = detail::evaluate_node_simd(
+                                {.t = inst.op_type},
+                                data, n_rows, row_id + b * SIMD_WIDTH,
+                                (__m256[]){op, _mm256_setzero_ps()}
+                            );
+                            
+                            _mm256_store_ps(&stack_data[stack_top][b * SIMD_WIDTH], result);
+                        }
+                        // Handle remaining elements
+                        for (int i = full_simd_iters * SIMD_WIDTH; i < actual_batch; ++i) {
+                            const float inputs[2] = {
+                                stack_data[stack_top][i],
+                                0.0f
+                            };
+                            stack_data[stack_top][i] = detail::evaluate_node(
+                                {.t = inst.op_type},
+                                data,
+                                n_rows,
+                                row_id + i,
+                                inputs
+                            );
+                        }
                         stack_top++;
                         break;
                     }
                 }
             }
             
-            __m256 final_result = _mm256_load_ps(&stack_data[stack_top-1][0]);
-            if (row_id + 8 <= n_rows) {
-                _mm256_storeu_ps(y_pred + output_offset + row_id, final_result);
-            } else {
-                alignas(32) float final_vals[8];
-                _mm256_store_ps(final_vals, final_result);
-                for (int i = 0; i < n_rows - row_id; ++i) {
-                    y_pred[output_offset + row_id + i] = final_vals[i];
-                }
+            // Store results
+            for (int b = 0; b < full_simd_iters; ++b) {
+                __m256 final_result = _mm256_load_ps(&stack_data[stack_top-1][b * SIMD_WIDTH]);
+                _mm256_storeu_ps(y_pred + output_offset + row_id + b * SIMD_WIDTH, final_result);
+            }
+            // Handle remaining elements
+            for (int i = full_simd_iters * SIMD_WIDTH; i < actual_batch; ++i) {
+                y_pred[output_offset + row_id + i] = stack_data[stack_top-1][i];
             }
         }
     }

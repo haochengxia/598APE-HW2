@@ -1,5 +1,57 @@
 # 598APE-HW2
 
+This repository contains optimized code for homework 2 of 598APE.
+
+You can select features by editing the Makefile, all optimizations are disabled by default.
+
+## Artifacts evaluation instructions
+
+### Additional prerequisites
+
+Running `bash ae/5_final_icpx.sh` requires these:
+
+- Intel Compiler
+- Intel OneAPI
+
+How to install
+
+```bash
+bash ./install_icpx.sh
+```
+
+### How to run
+
+For the results of Figure 1,
+
+```bash
+bash ae/1_better_opt.sh
+bash ae/2_stack.sh
+```
+
+For the results of Figure 2,
+
+```bash
+bash ae/3_omp.sh
+```
+
+For the results of Table 1,
+
+```bash
+bash ae/0_origin.sh
+bash ae/4_final_auto.sh
+bash ae/5_final_icpx.sh
+```
+
+## Other information
+
+Flamgraphs for the original code are attached in the `fig` folder.
+
+# Upstream
+
+---
+
+# 598APE-HW2
+
 This repository contains code for homework 2 of 598APE.
 
 In particular, this repository is an implementation of Symbolic Regression and Classification.

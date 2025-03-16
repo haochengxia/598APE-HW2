@@ -46,10 +46,6 @@ ifeq ($(ENABLE_STACK), 1)
     EXTRA_FLAGS += -DENABLE_STACK
 endif
 
-ifeq ($(ENABLE_KERNEL), 1)
-    EXTRA_FLAGS += -DENABLE_KERNEL -fopenmp -ffast-math
-endif
-
 ifeq ($(ENABLE_REMOVE_INSERTION_SORT), 1)
     EXTRA_FLAGS += -DENABLE_REMOVE_INSERTION_SORT
 endif
